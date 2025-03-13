@@ -21,9 +21,13 @@ from natsort import natsorted
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from utils.transient_utils import LinearSegmentationHead, DinoFeatureExatractor, dilate_mask
+from utils.transient_utils import DinoFeatureExatractor, dilate_mask, FeatUp_FeatureExtractor, ConvDPT
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from lpipsPyTorch import lpips
+import torch.nn.functional as F
+import json
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,10 +47,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     masks_bank = {}
     if not pipe.disable_transient:
+        #feature_extractor = DinoFeatureExatractor(pipe.dino_version)
+        featup_extractor = FeatUp_FeatureExtractor()
         feature_extractor = DinoFeatureExatractor(pipe.dino_version)
-        transient_model = LinearSegmentationHead(1, feature_extractor.dino_model.embed_dim).cuda()
+        #transient_model = LinearSegmentationHead(1, feature_extractor.dino_model.embed_dim).cuda()
+        #transient_model = LinearSegmentationHead(3, feature_extractor.dino_model.embed_dim).cuda()
+        #transient_model = UnetModel(3, 3).cuda()
+        transient_model = ConvDPT(feature_extractor.dino_model.embed_dim).cuda()
         transient_model.train()
-        transient_optimizer = torch.optim.Adam(transient_model.parameters(), lr=1e-3)
+        transient_optimizer = torch.optim.Adam(transient_model.parameters(), lr=5e-3)
+        transient_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(transient_optimizer, opt.iterations, 2e-4)
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -113,6 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         diff = l1_loss(image, gt_image, average=False)
         ssim_value = (ssim(image, gt_image, size_average=False))
+        dssim = (1 - ssim_value)/2.
 
         transient_loss = 0
 
@@ -131,29 +142,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 transient_optimizer.zero_grad()
 
                 transient_input = torch.cat((gt_image.unsqueeze(0), image.detach().unsqueeze(0)))
-                features = feature_extractor.extract(transient_input).squeeze()
+                features = featup_extractor.extract(transient_input)
+                d_cos =  1-F.cosine_similarity(features[0].permute(1,2,0), features[1].permute(1,2,0), dim=2).reshape(-1, 1, 256, 256)
+                d_cos = F.interpolate(
+                    d_cos,
+                    size=(gt_image.shape[1], gt_image.shape[2]),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze()
 
-                transient_maps = transient_model(features)
+                transient_maps = transient_model(transient_input, feature_extractor)
 
-                transient_mask = transient_maps[0].detach()
+                sigma_1 = transient_maps[0][0]
+                sigma_2 = transient_maps[0][1]
+                rho     = transient_maps[0][2]
+                s_1 = transient_maps[1][0]
+                s_2 = transient_maps[1][1]
+                r   = transient_maps[1][2]
+
+                #Calculate divergence
+                det = sigma_1.square()*sigma_2.square()*(1.-rho.square())
+                det_render = torch.clamp(s_1.square()*s_2.square()*(1 - r.square()), min=1e-6)
+
+                KL = ((sigma_1.square()/torch.clamp(s_1.square(), min=1e-6) \
+                    + sigma_2.square()/torch.clamp(s_2.square(), min=1e-6) \
+                    - rho*r*sigma_1*sigma_2/(s_1*s_2))/torch.clamp(1. - rho.square(), min=1e-6) \
+                    - torch.log(det/det_render) - 2)*0.5
+
+                #Calculate likelihood
+                transient_loss = ( 1/torch.clamp(1. - rho.square(), min=1e-6) ) \
+                                  *(d_cos.detach().square() / torch.clamp(sigma_1.square(), min=1e-6) \
+                                  + dssim.mean(0).detach().square() / torch.clamp(sigma_2.square(), min=1e-6) \
+                                  - 2*d_cos.detach()*dssim.mean(0).detach()*rho/ torch.clamp(sigma_1*sigma_2, min=1e-6)) \
+                                  + torch.log(torch.clamp(det, min=1e-6))
+                transient_loss = transient_loss.mean()
+
+
+                #Mask post-processing
+                transient_mask = KL.clone().detach()
                 if not pipe.disable_dilate:
-                    transient_mask = 1-dilate_mask(1-transient_mask, 1)
+                    transient_mask = dilate_mask(transient_mask, opt.dilate_exp)
+                mask = torch.where(transient_mask < opt.KL_threshold, 1, 0)
 
-                mask = LinearSegmentationHead.interpolate(transient_mask, gt_image.shape[1], gt_image.shape[2]).squeeze()
-                transient_maps = LinearSegmentationHead.interpolate(transient_maps, gt_image.shape[1], gt_image.shape[2]).squeeze()
+                
+                alpha = np.exp(opt.schedule_beta * np.floor((1 + iteration) / 1.5))
+                mask = torch.bernoulli(
+                    torch.clip(alpha + (1 - alpha) * mask,
+                    min=0.0, max=1.0)
+                )
 
+                mask = mask.detach()
                 masks_bank[viewpoint_cam.image_name] = mask
-
-                masked_diff = torch.mean(diff.detach() * transient_maps[0])
-                mask_reg = torch.abs(1 - transient_maps[0]).mean()
-                transient_loss = masked_diff + 0.1 * mask_reg
-
-                if not pipe.disable_consistency:
-                    consistency_reg = torch.mean((1 - transient_maps[0]) * (1 - transient_maps[1].detach()))
-                    transient_loss += consistency_reg
 
                 transient_loss.backward()
                 transient_optimizer.step()
+                transient_scheduler.step()
             else:
                 mask = masks_bank.get(viewpoint_cam.image_name, torch.ones(gt_image.shape[2:]).to("cuda"))
 
@@ -162,8 +205,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         else:
             if viewpoint_cam.mask is not None:
-                Ll1 = torch.mean(diff * viewpoint_cam.mask)
-                ssim_value = torch.mean(ssim_value * viewpoint_cam.mask)
+                if not pipe.disable_dilate:
+                    mask = 1. - dilate_mask(1. - (viewpoint_cam.mask.squeeze(0)).float(), opt.dilate_exp)
+                else:
+                    mask = viewpoint_cam.mask
+                mask = mask.detach()
+                masks_bank[viewpoint_cam.image_name] = mask
+                Ll1 = torch.mean(diff * mask)
+                ssim_value = torch.mean(ssim_value * mask)
             else:
                 Ll1 = torch.mean(diff)
                 ssim_value = torch.mean(ssim_value)
@@ -227,6 +276,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 make_video(rendered_images, scene.model_path, "train", fps=fps)
 
                 if scene.getTestCameras():
+                #if True:
                     eval_cams = natsorted(scene.getTestCameras(), key=lambda x: x.image_name)
                     rendered_images = []
                     for cam in tqdm(eval_cams):
@@ -235,9 +285,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     make_video(rendered_images, scene.model_path, "test", fps=fps)
                     evaluate(gaussians, eval_cams, pipe, background, os.path.join(args.model_path, "report.txt"))
 
-                if not pipe.disable_transient:
+                #if not pipe.disable_transient:
+                if True:
                     masked_frames = []
-                    transient_model.eval()
+                    #transient_model.eval()
                     for viewpoint_cam in tqdm(cams):
                         gt_image = viewpoint_cam.original_image.cuda()
                         mask = masks_bank[viewpoint_cam.image_name]
@@ -279,6 +330,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 def evaluate(gaussians, cameras, pipeline, background, path_to_save):
     ssims = []
     psnrs = []
+    lpipss = []
 
     for idx, view in enumerate(tqdm(cameras)):
         with torch.no_grad():
@@ -286,15 +338,19 @@ def evaluate(gaussians, cameras, pipeline, background, path_to_save):
             gt_image = torch.clamp(view.original_image.to("cuda"), 0.0, 1.0)
             ssims.append(ssim(rendered_img, gt_image).mean())
             psnrs.append(psnr(rendered_img, gt_image).mean())
+            lpipss.append(lpips(rendered_img, gt_image, net_type='vgg').mean())
             if (idx + 1) % 50 == 0:
                 torch.cuda.empty_cache()
     
     print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
     print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
+    print("  LPIPS : {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
     with open(path_to_save, "w") as f:
         f.write("SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
         f.write("\n")
         f.write("PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
+        f.write("\n")
+        f.write("LPIPS : {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -342,6 +398,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -362,9 +420,18 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])    
+                ssim_test /= len(config['cameras'])  
+                lpips_test /= len(config['cameras'])
+                final_results = {'PSNR': psnr_test, 'SSIM': ssim_test, 'LPIPS': lpips_test, 'L1': l1_test}
+
+                #with open(os.path.join(args.model_path, "/results.json"), 'w') as fp:
+                    #json.dump(final_results, fp, indent=True)        
+
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} LPIPS {} SSIM {}".format(iteration, config['name'], l1_test, psnr_test, lpips_test, ssim_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)

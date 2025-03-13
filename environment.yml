@@ -20,3 +20,8 @@ dependencies:
     - scipy
     - imageio==2.31.2
     - imageio-ffmpeg==0.4.9
+    - opencv-python
+    - ftfy
+    - lpips
+    - plyfile
+    - git+https://github.com/mhamilton723/FeatUp.git

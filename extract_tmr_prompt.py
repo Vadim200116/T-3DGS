@@ -8,10 +8,11 @@ from argparse import ArgumentParser
 from arguments import PipelineParams
 import torch
 from utils.general_utils import prep_img
-from utils.transient_utils import LinearSegmentationHead, DinoFeatureExatractor
+from utils.transient_utils import DinoFeatureExatractor, dilate_mask, FeatUp_FeatureExtractor, ConvDPT
 from tqdm import tqdm 
 from gaussian_renderer import render
 from PIL import Image
+import torch.nn.functional as F
 
 from copy import deepcopy
 
@@ -48,8 +49,9 @@ class GaussianSplattingModel:
 
         self.feature_extractor = DinoFeatureExatractor(dino_version)
         transient_path = model_path + f"/transient_{iteration}.pth"
+        self.featup_extractor = FeatUp_FeatureExtractor()
         
-        self.transient_model = LinearSegmentationHead(1, self.feature_extractor.dino_model.embed_dim).cuda()
+        self.transient_model = ConvDPT(self.feature_extractor.dino_model.embed_dim).cuda()
         self.transient_model.load_state_dict(torch.load(transient_path))
         self.transient_model.eval()
 
@@ -73,12 +75,35 @@ class GaussianSplattingModel:
     def save_masks(self, masks_dir):
         for frame_idx, cam in tqdm(enumerate(self.train_cams)):
             gt_image = cam.original_image
+            image = self.render_image(frame_idx)
 
-            transient_input = gt_image.unsqueeze(0)
-            features = self.feature_extractor.extract(transient_input).unsqueeze(0)
-            weights = LinearSegmentationHead.interpolate(self.transient_model(features), gt_image.shape[1], gt_image.shape[2]).squeeze()
+            transient_input = torch.cat((gt_image.unsqueeze(0), image.detach().unsqueeze(0)))
+            features = self.featup_extractor.extract(transient_input)
+            d_cos =  1-F.cosine_similarity(features[0].permute(1,2,0), features[1].permute(1,2,0), dim=2).reshape(-1, 1, 256, 256)
+            d_cos = F.interpolate(
+                d_cos,
+                size=(gt_image.shape[1], gt_image.shape[2]),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
 
-            mask = (weights > 0.5).detach().cpu().numpy()    
+            transient_maps = self.transient_model(transient_input, self.feature_extractor)
+            sigma_1 = transient_maps[0][0]
+            sigma_2 = transient_maps[0][1]
+            rho     = transient_maps[0][2]
+            s_1 = transient_maps[1][0]
+            s_2 = transient_maps[1][1]
+            r   = transient_maps[1][2]
+
+            det = sigma_1.square()*sigma_2.square()*(1.-rho.square())
+            det_render = torch.clamp(s_1.square()*s_2.square()*(1 - r.square()), min=1e-6)
+
+            KL = ((sigma_1.square()/torch.clamp(s_1.square(), min=1e-6) \
+                + sigma_2.square()/torch.clamp(s_2.square(), min=1e-6) \
+                - rho*r*sigma_1*sigma_2/(s_1*s_2))/torch.clamp(1. - rho.square(), min=1e-6) \
+                - torch.log(det/det_render) - 2)*0.5
+
+            mask = (KL > 30).detach().cpu().numpy()    
             Image.fromarray(~mask).save(os.path.join(masks_dir, f"{frame_idx:05d}.png"))
 
 

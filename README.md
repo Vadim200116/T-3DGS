@@ -3,23 +3,15 @@
 ## [Project Page](https://transient-3dgs.github.io/) | [Paper](https://arxiv.org/abs/2412.00155)
 
 ## Abstract
-We propose a novel framework to remove transient objects
-from input videos for 3D scene reconstruction using Gaussian Splatting. Our framework consists of the following
-steps. In the first step, we propose an unsupervised training
-strategy for a classification network to distinguish between
-transient objects and static scene parts based on their different training behavior inside the 3D Gaussian Splatting reconstruction. In the second step, we improve the boundary quality and stability of the detected transients by combining our results from the first step with an off-the-shelf segmentation method. We also propose a simple and effective strategy
-to track objects in the input video forward and backward in
-time. Our results show an improvement over the current
-state of the art in existing sparsely captured datasets and
-significant improvements in a newly proposed densely captured (video) dataset.
+Transient objects in video sequences can significantly degrade the quality of 3D scene reconstructions. To address this challenge, we propose T-3DGS, a novel framework that robustly filters out transient distractors during 3D reconstruction using Gaussian Splatting. Our framework consists of two steps. First, we employ an unsupervised classification network that distinguishes transient objects from static scene elements by leveraging their distinct training dynamics within the reconstruction process. Second, we refine these initial detections by integrating an off-the-shelf segmentation method with a bidirectional tracking module, which together enhance boundary accuracy and temporal coherence. Evaluations on both sparsely and densely captured video datasets demonstrate that T-3DGS significantly outperforms state-of-the-art approaches, enabling high-fidelity 3D reconstructions in challenging, real-world scenarios.
 
 ## Overview
-This repository implements Transient Mask Predictor (TMP), a solution for handling transient objects in 3D scene reconstruction. For mask refinement functionality (TMR), please refer to our [companion repository](https://github.com/Vadim200116/AutoVidSeg).
+This repository implements Reconstruction Uncertainty Predictor (RUP), a solution for handling transient objects in 3D scene reconstruction. For mask refinement functionality (TMR), please refer to our [companion repository](https://github.com/Vadim200116/AutoVidSeg).
 
 
 ## Key Features
 - **Automatic Detection of Transient Objects:** Integrate transient object removal seamlessly into the 3D reconstruction pipeline.
-- **Two-Stage Pipeline:** Combines TMP and TMR for enhanced mask prediction and refinement.
+- **Two-Stage Pipeline:** Combines RUP and TMR for enhanced mask prediction and refinement.
 - **Docker Support:** Simplifies deployment and setup across different environments.
 
 
@@ -31,9 +23,8 @@ The installation process aligns with the original [Gaussian Splatting](https://g
 
 By default, the following features are enabled:
 
-- **Transient Mask Prediction (TMP)**
+- **Reconstruction Uncertainty Predictor (RUP)**
 - **Mask Dilation**
-- **Consistency Loss**
 - **Depth Regularization**
 
 ### Training the Model
@@ -46,7 +37,7 @@ python train.py -s [path to dataset]
 
 ### Customizing Training Options
 To disable specific features, use the following flags:
-- **Disable Transient Mask Predictor (TMP):**
+- **Disable Reconstruction Uncertainty Predictor (RUP):**
 
 ```bash
 python train.py -s [path to dataset] --disable_transient
@@ -58,11 +49,6 @@ python train.py -s [path to dataset] --disable_transient
 python train.py -s [path to dataset] --disable_dilate
 ```
 
-- **Disable Consistency Loss:**
-
-```bash
-python train.py -s [path to dataset] --disable_consistency
-```
 - **Disable Depth Regularization:**
 
 ```bash
